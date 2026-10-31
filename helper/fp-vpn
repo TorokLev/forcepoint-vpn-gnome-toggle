@@ -1,0 +1,173 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Install to /usr/local/bin/fp-vpn (root-owned, chmod 755).
+# connect / disconnect run via sudo; status runs as the normal user.
+#
+# Settings are read from the calling user's ~/.config/fp-vpn.conf
+# (KEY=value lines). The file is parsed, never sourced, and every
+# value is validated, because this script runs as root.
+set -u
+
+PIDFILE=/run/fp-vpn.pid
+STATEFILE=/run/fp-vpn.state
+LOG=/var/log/fp-vpn.log
+LOGIN_TIMEOUT=60          # seconds to wait for the login to complete
+SELF="$(readlink -f "$0")"
+
+die() { echo "fp-vpn: $*" >&2; exit 1; }
+
+is_running() {
+    [[ -f $PIDFILE ]] && [[ -d /proc/$(cat "$PIDFILE") ]]
+}
+
+load_config() {
+    local user="${SUDO_USER:-}"
+    [[ -n $user && $user != root ]] || die "run via sudo from your normal user"
+    local home
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [[ -d $home ]] || die "no home directory for $user"
+
+    local conf="$home/.config/fp-vpn.conf"
+    [[ -f $conf && ! -L $conf ]] || die "missing $conf"
+
+    # Defaults
+    GATEWAY="" PORT=443 VPN_USER="" CONF_DIR="" RESOLVER=/usr/bin/resolvectl
+
+    local key val
+    while IFS='=' read -r key val; do
+        key="${key//[[:space:]]/}"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+        [[ -z $key || $key == \#* ]] && continue
+        case "$key" in
+            GATEWAY)  GATEWAY=$val ;;
+            PORT)     PORT=$val ;;
+            USERNAME) VPN_USER=$val ;;
+            CONF_DIR) CONF_DIR=$val ;;
+            RESOLVER) RESOLVER=$val ;;
+            *) die "unknown setting '$key' in $conf" ;;
+        esac
+    done <"$conf"
+
+    # Validation: these values end up in a root command line.
+    [[ $GATEWAY =~ ^[A-Za-z0-9.-]{1,253}$ ]]     || die "invalid GATEWAY"
+    [[ $PORT =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "invalid PORT"
+    [[ $VPN_USER =~ ^[A-Za-z0-9._@\\-]{1,64}$ ]] || die "invalid USERNAME"
+
+    # Config folder defaults to the same layout as the official client.
+    [[ -n $CONF_DIR ]] || CONF_DIR="$home/.config/forcepoint/sslvpn/${GATEWAY}_${PORT}"
+    CONF_DIR=$(realpath -m -- "$CONF_DIR")
+    [[ $CONF_DIR == "$home"/* ]]                 || die "CONF_DIR must be inside $home"
+
+    case "$RESOLVER" in
+        /usr/bin/resolvectl|/usr/sbin/resolvconf|/sbin/resolvconf|none) ;;
+        *) die "RESOLVER must be /usr/bin/resolvectl, resolvconf or none" ;;
+    esac
+}
+
+# Internal: runs as root in its own session (started by "connect").
+# Password arrives on stdin. Starts the client, watches its output,
+# answers the password prompt only once it appears, tracks the state.
+run_client() {
+    [[ $EUID -eq 0 ]] || die "internal command"
+    local pw line sent=0 authed=0 state started=$SECONDS
+    IFS= read -r pw
+    exec 0</dev/null
+
+    local in out
+    in=$(mktemp -u /run/fp-vpn-in.XXXXXX)
+    out=$(mktemp -u /run/fp-vpn-out.XXXXXX)
+    mkfifo -m 600 "$in" "$out" || exit 1
+
+    # Unbuffered output so the prompt reaches us immediately.
+    local buf=()
+    command -v stdbuf >/dev/null && buf=(stdbuf -o0 -e0)
+
+    "${buf[@]}" forcepoint-client "$@" <"$in" >"$out" 2>&1 &
+    local cpid=$!
+    exec 3>"$in" 4<"$out"
+    rm -f "$in" "$out"
+    echo connecting >"$STATEFILE"
+
+    while true; do
+        if IFS= read -r -t 5 line <&4; then
+            printf '%s\n' "$line"
+            if [[ $line == *"Please enter password"* ]]; then
+                if (( sent )); then
+                    echo "fp-vpn: password asked again (wrong password?), stopping"
+                    kill -TERM "$cpid" 2>/dev/null
+                else
+                    sleep 0.5                       # let the client finish its prompt
+                    printf '%s\n' "$pw" >&3
+                    pw=""
+                    sent=1
+                    echo "fp-vpn: password sent"
+                fi
+            elif [[ $line == *"STATE cid"*"changed to: "* ]]; then
+                state=${line##*changed to: }
+                if [[ $state == DISCONNECTED ]]; then
+                    echo disconnected >"$STATEFILE"
+                elif (( sent )) && [[ $state != HANDSHAKING && $state != CONNECTING ]]; then
+                    authed=1
+                    echo connected >"$STATEFILE"
+                    echo "fp-vpn: login complete (state $state)"
+                fi
+            fi
+        elif (( $? <= 128 )); then
+            break                                   # client closed its output
+        fi
+        if (( ! authed && SECONDS - started > LOGIN_TIMEOUT )); then
+            echo "fp-vpn: login not completed within ${LOGIN_TIMEOUT}s, stopping"
+            kill -TERM "$cpid" 2>/dev/null
+            started=$SECONDS                        # don't repeat the message
+        fi
+    done
+    wait "$cpid"
+    echo disconnected >"$STATEFILE"
+}
+
+case "${1:-}" in
+    connect)
+        is_running && exit 0
+        load_config
+
+        # Password: typed at a terminal, or piped in (the extension sends it
+        # from GNOME Keyring on stdin).
+        if [[ -t 0 ]]; then
+            IFS= read -rsp "VPN password for $VPN_USER: " PW; echo >&2
+        else
+            IFS= read -r PW || true
+        fi
+        [[ -n ${PW:-} ]] || die "no password given on stdin"
+
+        echo "=== $(date '+%F %T') fp-vpn connect to $GATEWAY:$PORT as $VPN_USER" >>"$LOG"
+        setsid "$SELF" _run "$GATEWAY" -p "$PORT" -u "$VPN_USER" -c "$CONF_DIR" \
+            -V --resolver "$RESOLVER" <<<"$PW" >>"$LOG" 2>&1 &
+        echo $! >"$PIDFILE"
+        PW=""
+        ;;
+    disconnect)
+        if is_running; then
+            pid=$(cat "$PIDFILE")
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+        fi
+        rm -f "$PIDFILE"
+        echo disconnected >"$STATEFILE"
+        ;;
+    status)
+        if is_running; then
+            state=$(cat "$STATEFILE" 2>/dev/null)
+            [[ $state == connected ]] && echo connected || echo connecting
+        else
+            echo disconnected
+        fi
+        ;;
+    _run)
+        shift
+        run_client "$@"
+        ;;
+    *)
+        echo "usage: $0 connect|disconnect|status" >&2
+        exit 2
+        ;;
+esac

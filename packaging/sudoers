@@ -1,0 +1,3 @@
+# Installed by the forcepoint-vpn-gnome-toggle package.
+# Members of the fp-vpn group may run only these two commands as root.
+%fp-vpn ALL=(root) NOPASSWD: /usr/bin/fp-vpn connect, /usr/bin/fp-vpn disconnect

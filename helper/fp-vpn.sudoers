@@ -1,0 +1,3 @@
+# Template for /etc/sudoers.d/fp-vpn. install.sh fills in YOURUSER.
+# Allows only this one root-owned script, only with these two arguments.
+YOURUSER ALL=(root) NOPASSWD: /usr/local/bin/fp-vpn connect, /usr/local/bin/fp-vpn disconnect

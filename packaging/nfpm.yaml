@@ -1,0 +1,54 @@
+# Build from the repository root:
+#   VERSION=1.0.0 nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+#   VERSION=1.0.0 nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+name: forcepoint-vpn-gnome-toggle
+arch: all
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: net
+priority: optional
+maintainer: "Levente Torok"
+homepage: https://github.com/TorokLev/forcepoint-vpn-gnome-toggle
+license: GPL-2.0-or-later
+description: |-
+  Unofficial one-click Forcepoint VPN toggle for GNOME Shell.
+  Adds a Quick Settings tile and a settings window that drive the official
+  Forcepoint VPN Client for Linux (forcepoint-client), with the password kept
+  in GNOME Keyring. The Forcepoint client itself is not included.
+
+overrides:
+  deb:
+    depends: [gnome-shell, sudo, libsecret-tools, coreutils]
+    recommends: [systemd-resolved]
+  rpm:
+    depends: [gnome-shell, sudo, libsecret, coreutils, shadow-utils]
+
+contents:
+  - src: ./helper/fp-vpn
+    dst: /usr/bin/fp-vpn
+    file_info:
+      mode: 0755
+
+  - src: ./packaging/sudoers
+    dst: /etc/sudoers.d/forcepoint-vpn-toggle
+    type: config|noreplace
+    file_info:
+      mode: 0440
+
+  - src: ./extension/forcepoint-vpn@local
+    dst: /usr/share/gnome-shell/extensions/forcepoint-vpn@local
+    type: tree
+
+  - src: ./fp-vpn.conf.example
+    dst: /usr/share/doc/forcepoint-vpn-gnome-toggle/fp-vpn.conf.example
+  - src: ./README.md
+    dst: /usr/share/doc/forcepoint-vpn-gnome-toggle/README.md
+  - src: ./LICENSE
+    dst: /usr/share/licenses/forcepoint-vpn-gnome-toggle/LICENSE
+
+scripts:
+  postinstall: ./packaging/postinstall.sh
+  preremove: ./packaging/preremove.sh
+  postremove: ./packaging/postremove.sh

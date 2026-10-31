@@ -1,0 +1,8 @@
+# Copy to ~/.config/fp-vpn.conf (install.sh does this for you),
+# or edit everything from the extension's Settings window.
+GATEWAY=vpn.example.com
+PORT=443
+USERNAME=your.username
+# Optional; defaults to ~/.config/forcepoint/sslvpn/<GATEWAY>_<PORT>
+#CONF_DIR=/home/you/.config/forcepoint/sslvpn/vpn.example.com_443
+RESOLVER=/usr/bin/resolvectl

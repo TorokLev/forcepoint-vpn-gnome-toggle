@@ -1,0 +1,7 @@
+# Personal settings never belong in the repo
+fp-vpn.conf
+*.log
+# Packaging output
+*.zip
+*.shell-extension.zip
+dist/

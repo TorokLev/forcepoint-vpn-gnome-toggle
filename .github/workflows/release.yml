@@ -1,0 +1,55 @@
+# Builds .deb, .rpm and the extension zip, and publishes a GitHub Release
+# whenever a tag like v1.0.0 is pushed.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: 2.47.0
+  NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check shell scripts
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+          shellcheck -S warning install.sh helper/fp-vpn
+          shellcheck -s sh -S warning packaging/*.sh
+
+      - name: Install nFPM (pinned, checksum verified)
+        run: |
+          f="nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSLO "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/${f}"
+          echo "${NFPM_SHA256}  ${f}" | sha256sum -c -
+          tar xzf "$f" nfpm && sudo mv nfpm /usr/local/bin/
+
+      - name: Build packages
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+          nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+          (cd extension/forcepoint-vpn@local && zip -r "../../dist/forcepoint-vpn@local.shell-extension.zip" .)
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## \\[?"v"\\]?" {on=1; next}
+            /^## / && on {exit}
+            on' CHANGELOG.md)
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "${notes:-See CHANGELOG.md}"

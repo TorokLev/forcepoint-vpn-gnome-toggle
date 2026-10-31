@@ -1,0 +1,8 @@
+{
+  "uuid": "forcepoint-vpn@local",
+  "name": "Forcepoint VPN Toggle",
+  "description": "Unofficial one-click connect/disconnect for the Forcepoint VPN Client for Linux (CLI). Requires the helper script from the project repository.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/TorokLev/forcepoint-vpn-gnome-toggle",
+  "version-name": "1.0.0"
+}
