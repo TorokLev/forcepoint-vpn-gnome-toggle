@@ -188,6 +188,6 @@ VERSION=1.0.0 nfpm package --config packaging/nfpm.yaml --packager deb --target 
 
 ## License
 
-[GPL-2.0-or-later](LICENSE), like GNOME Shell itself.
+[Apache-2.0](LICENSE).
 
 Forcepoint is a trademark of its respective owner. It is used here only to describe what this tool works with.

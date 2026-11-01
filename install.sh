@@ -1,5 +1,5 @@
 #!/bin/bash
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: Apache-2.0
 #
 # Installs or removes the Forcepoint VPN GNOME toggle.
 #   ./install.sh              install or update
