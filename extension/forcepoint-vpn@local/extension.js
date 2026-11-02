@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
@@ -6,9 +6,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-// install.sh puts the helper in /usr/local/bin, the .deb/.rpm in /usr/bin.
-const HELPER = ['/usr/local/bin/fp-vpn', '/usr/bin/fp-vpn']
-    .find(p => GLib.file_test(p, GLib.FileTest.IS_EXECUTABLE)) ?? '/usr/bin/fp-vpn';
+const HELPER = '/usr/local/bin/fp-vpn';
 const POLL_SECONDS = 5;
 const SECRET_SERVICE = 'forcepoint-vpn';
 
@@ -90,16 +88,10 @@ class VpnToggle extends QuickMenuToggle {
         });
     }
 
-    // state: 'connected' | 'connecting' | 'disconnected'
-    setState(state) {
-        // While connecting the tile is "on", so a click cancels.
-        this.checked = state !== 'disconnected';
-        if (!this._busy) {
-            this.subtitle = {
-                connected: 'Connected',
-                connecting: 'Connecting…',
-            }[state] ?? 'Disconnected';
-        }
+    setConnected(connected) {
+        this.checked = connected;
+        if (!this._busy)
+            this.subtitle = connected ? 'Connected' : 'Disconnected';
     }
 });
 
@@ -124,12 +116,11 @@ class VpnIndicator extends SystemIndicator {
     async refresh() {
         // "status" needs no root, so no sudo here.
         const r = await run([HELPER, 'status']);
-        const out = r.stdout.trim();
-        const state = r.ok && ['connected', 'connecting'].includes(out) ? out : 'disconnected';
+        const connected = r.ok && r.stdout.trim() === 'connected';
         if (!this._toggle)
             return; // destroyed while waiting
-        this._icon.visible = state === 'connected';
-        this._toggle.setState(state);
+        this._icon.visible = connected;
+        this._toggle.setConnected(connected);
     }
 
     destroy() {

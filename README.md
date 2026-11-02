@@ -38,20 +38,20 @@ Pick **one** of the two methods. If you switch, uninstall the other first.
 
 ### Option A: package (Ubuntu/Debian, Fedora/RHEL)
 
-Download the package from the [latest release](https://github.com/TorokLev/forcepoint-vpn-gnome-toggle/releases/latest), then:
+Download the package from the [latest release](https://github.com/YOUR_GITHUB_USER/forcepoint-vpn-gnome-toggle/releases/latest), then:
 
 ```bash
 sudo apt install ./forcepoint-vpn-gnome-toggle_*_all.deb        # Ubuntu / Debian
 sudo dnf install ./forcepoint-vpn-gnome-toggle-*.noarch.rpm     # Fedora / RHEL
 ```
 
-The package installs the helper to `/usr/bin/fp-vpn`, the extension system-wide, and a sudo rule for members of the **`fp-vpn`** group. The user who ran the install command is added to that group automatically. To allow other users:
+The package installs the helper to `/usr/bin/fp-vpn`, the extension system-wide, and a sudo rule for members of the **`fp-vpn`** group. The user who ran the install command is added to that group and gets the extension enabled automatically. To allow other users:
 
 ```bash
-sudo usermod -aG fp-vpn <user>
+sudo gpasswd -a <user> fp-vpn
 ```
 
-Then log out and back in (needed for the new group and the extension) and enable it:
+Then **reboot** (a logout is not always enough for a new group to reach the desktop session). Other users enable the extension themselves:
 
 ```bash
 gnome-extensions enable forcepoint-vpn@local
@@ -62,7 +62,7 @@ Remove with `sudo apt remove forcepoint-vpn-gnome-toggle` (or `apt purge` to als
 ### Option B: install script (any distro)
 
 ```bash
-git clone https://github.com/TorokLev/forcepoint-vpn-gnome-toggle.git
+git clone https://github.com/YOUR_GITHUB_USER/forcepoint-vpn-gnome-toggle.git
 cd forcepoint-vpn-gnome-toggle
 ./install.sh
 ```
@@ -188,6 +188,6 @@ VERSION=1.0.0 nfpm package --config packaging/nfpm.yaml --packager deb --target 
 
 ## License
 
-[Apache-2.0](LICENSE).
+[GPL-2.0-or-later](LICENSE), like GNOME Shell itself.
 
 Forcepoint is a trademark of its respective owner. It is used here only to describe what this tool works with.

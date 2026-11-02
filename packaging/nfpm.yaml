@@ -9,9 +9,9 @@ version_schema: semver
 release: 1
 section: net
 priority: optional
-maintainer: "Levente Torok"
-homepage: https://github.com/TorokLev/forcepoint-vpn-gnome-toggle
-license: Apache-2.0
+maintainer: "YOUR NAME <you@example.com>"
+homepage: https://github.com/YOUR_GITHUB_USER/forcepoint-vpn-gnome-toggle
+license: GPL-2.0-or-later
 description: |-
   Unofficial one-click Forcepoint VPN toggle for GNOME Shell.
   Adds a Quick Settings tile and a settings window that drive the official
