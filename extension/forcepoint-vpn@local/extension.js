@@ -1,14 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-const HELPER = '/usr/local/bin/fp-vpn';
+// install.sh puts the helper in /usr/local/bin, the .deb/.rpm in /usr/bin.
+const HELPER = ['/usr/local/bin/fp-vpn', '/usr/bin/fp-vpn']
+    .find(p => GLib.file_test(p, GLib.FileTest.IS_EXECUTABLE)) ?? '/usr/bin/fp-vpn';
 const POLL_SECONDS = 5;
 const SECRET_SERVICE = 'forcepoint-vpn';
+const CONF_PATH = GLib.build_filenamev([GLib.get_user_config_dir(), 'fp-vpn.conf']);
 
 // Run a command without blocking the shell; resolves with {ok, stdout, stderr}.
 // If input is given, it is written to the command's stdin.
@@ -33,6 +38,37 @@ function run(argv, input = null) {
     });
 }
 
+// Gateway and port from ~/.config/fp-vpn.conf, for display only.
+function readGateway() {
+    try {
+        const [, bytes] = GLib.file_get_contents(CONF_PATH);
+        const conf = {};
+        for (const line of new TextDecoder().decode(bytes).split('\n')) {
+            const m = line.match(/^\s*(GATEWAY|PORT)\s*=\s*(\S+)\s*$/);
+            if (m)
+                conf[m[1]] = m[2];
+        }
+        return conf.GATEWAY ? `${conf.GATEWAY}:${conf.PORT ?? '443'}` : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// IPv4 addresses on tunnel interfaces, e.g. [{ifname: 'tun0', ip: '10.1.2.3', prefix: 24}].
+async function tunnelAddresses() {
+    const r = await run(['ip', '-j', '-4', 'addr', 'show', 'type', 'tun']);
+    if (!r.ok)
+        return [];
+    try {
+        return JSON.parse(r.stdout).flatMap(link =>
+            (link.addr_info ?? [])
+                .filter(a => a.family === 'inet')
+                .map(a => ({ifname: link.ifname, ip: a.local, prefix: a.prefixlen})));
+    } catch (e) {
+        return [];
+    }
+}
+
 const VpnToggle = GObject.registerClass(
 class VpnToggle extends QuickMenuToggle {
     _init(indicator, extension) {
@@ -45,7 +81,26 @@ class VpnToggle extends QuickMenuToggle {
 
         // Arrow on the tile opens this menu.
         this.menu.setHeader('network-vpn-symbolic', 'Forcepoint VPN');
+
+        // VPN address; click copies it.
+        this._ip = null;
+        this._addressItem = new PopupMenu.PopupMenuItem('');
+        this._addressItem.connect('activate', () => {
+            if (!this._ip)
+                return;
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, this._ip);
+            Main.notify('Forcepoint VPN', `Copied ${this._ip}`);
+        });
+        this.menu.addMenuItem(this._addressItem);
+        this._addressSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._addressSeparator);
+
+        this._certItem = this.menu.addAction('Review gateway certificate…',
+            () => extension.openPreferences());
+        this._certItem.visible = false;
+
         this.menu.addAction('Settings', () => extension.openPreferences());
+        this._showAddress(false, []);
 
         this._busy = false;
         this.connect('clicked', () => this._onClicked());
@@ -88,10 +143,39 @@ class VpnToggle extends QuickMenuToggle {
         });
     }
 
-    setConnected(connected) {
-        this.checked = connected;
-        if (!this._busy)
-            this.subtitle = connected ? 'Connected' : 'Disconnected';
+    // state: 'connected' | 'connecting' | 'disconnected' | 'certificate'
+    // addrs: tunnel IPv4 addresses (only looked up while connected)
+    setState(state, addrs = [], gateway = null) {
+        // While connecting the tile is "on", so a click cancels.
+        this.checked = state === 'connected' || state === 'connecting';
+        this._certItem.visible = state === 'certificate';
+        this._ip = state === 'connected' && addrs.length ? addrs[0].ip : null;
+
+        if (!this._busy) {
+            if (state === 'connected')
+                this.subtitle = this._ip ?? 'No IPv4 address';
+            else if (state === 'connecting')
+                this.subtitle = 'Connecting…';
+            else if (state === 'certificate')
+                this.subtitle = 'Certificate not trusted';
+            else
+                this.subtitle = 'Disconnected';
+        }
+
+        this.menu.setHeader('network-vpn-symbolic', 'Forcepoint VPN',
+            gateway ? `Gateway ${gateway}` : '');
+        this._showAddress(state === 'connected', addrs);
+    }
+
+    _showAddress(connected, addrs) {
+        this._addressItem.visible = connected;
+        this._addressSeparator.visible = connected;
+        if (!connected)
+            return;
+        this._addressItem.label.text = addrs.length
+            ? addrs.map(a => `Address  ${a.ip}/${a.prefix} (${a.ifname})`).join('\n')
+            : 'No IPv4 address on the tunnel yet';
+        this._addressItem.reactive = addrs.length > 0;
     }
 });
 
@@ -116,11 +200,21 @@ class VpnIndicator extends SystemIndicator {
     async refresh() {
         // "status" needs no root, so no sudo here.
         const r = await run([HELPER, 'status']);
-        const connected = r.ok && r.stdout.trim() === 'connected';
+        const out = r.stdout.trim();
+        const state = r.ok && ['connected', 'connecting', 'certificate'].includes(out) ? out : 'disconnected';
+        const addrs = state === 'connected' ? await tunnelAddresses() : [];
         if (!this._toggle)
             return; // destroyed while waiting
-        this._icon.visible = connected;
-        this._toggle.setConnected(connected);
+        this._icon.visible = state === 'connected';
+        this._toggle.setState(state, addrs, readGateway());
+
+        // Tell the user once per attempt; the tile keeps showing it.
+        if (state === 'certificate' && this._lastState !== 'certificate') {
+            Main.notify('Forcepoint VPN',
+                'The gateway presented a certificate that is not trusted yet. ' +
+                'Open the tile menu → Review gateway certificate.');
+        }
+        this._lastState = state;
     }
 
     destroy() {

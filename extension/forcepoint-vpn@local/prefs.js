@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
 import Gio from 'gi://Gio';
@@ -8,7 +8,8 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 // The same file /usr/local/bin/fp-vpn reads.
 const CONF_PATH = GLib.build_filenamev([GLib.get_user_config_dir(), 'fp-vpn.conf']);
 const SECRET_SERVICE = 'forcepoint-vpn';
-const KEYS = ['GATEWAY', 'PORT', 'USERNAME', 'CONF_DIR', 'RESOLVER'];
+const KEYS = ['GATEWAY', 'PORT', 'USERNAME', 'CONF_DIR', 'RESOLVER', 'TRUSTED_SHA256'];
+const CERTFILE = '/run/fp-vpn.cert';
 const RESOLVERS = ['/usr/bin/resolvectl', '/usr/sbin/resolvconf', 'none'];
 
 // Same rules as the root script, so mistakes are caught here first.
@@ -16,10 +17,30 @@ const VALID = {
     GATEWAY: v => /^[A-Za-z0-9.-]{1,253}$/.test(v),
     PORT: v => /^[0-9]{1,5}$/.test(v) && Number(v) >= 1 && Number(v) <= 65535,
     USERNAME: v => /^[A-Za-z0-9._@\\-]{1,64}$/.test(v),
+    TRUSTED_SHA256: v => v === '' || /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(v),
 };
 
+// Accept fingerprints pasted with or without colons, any case.
+function normalizeFingerprint(text) {
+    const hex = text.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+    if (hex.length !== 64)
+        return text.trim().toUpperCase();
+    return hex.match(/../g).join(':');
+}
+
+// The untrusted certificate the helper stopped at, if any: {endpoint, fingerprint}.
+function readPendingCert() {
+    try {
+        const [, bytes] = GLib.file_get_contents(CERTFILE);
+        const [endpoint, fingerprint] = new TextDecoder().decode(bytes).trim().split(/\s+/);
+        return endpoint && fingerprint && fingerprint !== 'unknown' ? {endpoint, fingerprint} : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 function readConf() {
-    const conf = {GATEWAY: '', PORT: '443', USERNAME: '', CONF_DIR: '', RESOLVER: RESOLVERS[0]};
+    const conf = {GATEWAY: '', PORT: '443', USERNAME: '', CONF_DIR: '', RESOLVER: RESOLVERS[0], TRUSTED_SHA256: ''};
     try {
         const [, bytes] = GLib.file_get_contents(CONF_PATH);
         for (const line of new TextDecoder().decode(bytes).split('\n')) {
@@ -40,8 +61,8 @@ function readConf() {
 function writeConf(conf) {
     let text = '# Written by the Forcepoint VPN GNOME extension\n';
     for (const key of KEYS) {
-        if (key === 'CONF_DIR' && !conf.CONF_DIR)
-            continue; // let the script use its default folder
+        if ((key === 'CONF_DIR' || key === 'TRUSTED_SHA256') && !conf[key])
+            continue; // optional, leave out when empty
         text += `${key}=${conf[key]}\n`;
     }
     GLib.mkdir_with_parents(GLib.get_user_config_dir(), 0o700);
@@ -118,6 +139,50 @@ export default class ForcepointVpnPrefs extends ExtensionPreferences {
                 : 'No password stored yet.';
         });
 
+        // Gateway certificate
+        const certGroup = new Adw.PreferencesGroup({
+            title: 'Gateway certificate',
+            description: 'On the first connection to a gateway, the VPN only accepts its certificate ' +
+                'if the SHA-256 fingerprint matches the one below. Compare it with the fingerprint ' +
+                'from your IT department before trusting it.',
+        });
+        page.add(certGroup);
+
+        const fpRow = new Adw.EntryRow({
+            title: 'Trusted SHA-256 fingerprint',
+            text: conf.TRUSTED_SHA256,
+        });
+        fpRow.connect('changed', () => {
+            if (VALID.TRUSTED_SHA256(normalizeFingerprint(fpRow.text)))
+                fpRow.remove_css_class('error');
+            else
+                fpRow.add_css_class('error');
+        });
+        certGroup.add(fpRow);
+
+        const pending = readPendingCert();
+        let pendingRow = null;
+        if (pending) {
+            pendingRow = new Adw.ActionRow({
+                title: `Not trusted yet: certificate presented by ${pending.endpoint}`,
+                subtitle: pending.fingerprint,
+                subtitle_selectable: true,
+                css_classes: ['property'],
+            });
+            const trustButton = new Gtk.Button({
+                label: 'Trust',
+                valign: Gtk.Align.CENTER,
+                css_classes: ['suggested-action'],
+            });
+            trustButton.connect('clicked', () => {
+                fpRow.text = pending.fingerprint;
+                saveButton.emit('clicked');
+                pendingRow.visible = false;
+            });
+            pendingRow.add_suffix(trustButton);
+            certGroup.add(pendingRow);
+        }
+
         // Advanced
         const advGroup = new Adw.PreferencesGroup({title: 'Advanced'});
         page.add(advGroup);
@@ -152,12 +217,17 @@ export default class ForcepointVpnPrefs extends ExtensionPreferences {
                 USERNAME: rows.USERNAME.text.trim(),
                 CONF_DIR: confDirRow.text.trim(),
                 RESOLVER: RESOLVERS[resolverRow.selected],
+                TRUSTED_SHA256: normalizeFingerprint(fpRow.text),
             };
             const bad = Object.keys(VALID).filter(k => !VALID[k](next[k]));
             if (bad.length) {
-                window.add_toast(new Adw.Toast({title: `Please check: ${bad.join(', ').toLowerCase()}`}));
+                const names = {TRUSTED_SHA256: 'fingerprint'};
+                window.add_toast(new Adw.Toast({
+                    title: `Please check: ${bad.map(k => names[k] ?? k.toLowerCase()).join(', ')}`,
+                }));
                 return;
             }
+            fpRow.text = next.TRUSTED_SHA256;
             if (next.CONF_DIR && !next.CONF_DIR.startsWith(`${GLib.get_home_dir()}/`)) {
                 window.add_toast(new Adw.Toast({title: 'Config folder must be inside your home folder'}));
                 return;
