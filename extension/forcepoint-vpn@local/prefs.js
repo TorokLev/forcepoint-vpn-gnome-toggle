@@ -8,7 +8,7 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 // The same file /usr/local/bin/fp-vpn reads.
 const CONF_PATH = GLib.build_filenamev([GLib.get_user_config_dir(), 'fp-vpn.conf']);
 const SECRET_SERVICE = 'forcepoint-vpn';
-const KEYS = ['GATEWAY', 'PORT', 'USERNAME', 'CONF_DIR', 'RESOLVER', 'TRUSTED_SHA256'];
+const KEYS = ['GATEWAY', 'PORT', 'USERNAME', 'CONF_DIR', 'RESOLVER', 'TRUSTED_SHA256', 'KEEP_LAN'];
 const CERTFILE = '/run/fp-vpn.cert';
 const RESOLVERS = ['/usr/bin/resolvectl', '/usr/sbin/resolvconf', 'none'];
 
@@ -40,7 +40,7 @@ function readPendingCert() {
 }
 
 function readConf() {
-    const conf = {GATEWAY: '', PORT: '443', USERNAME: '', CONF_DIR: '', RESOLVER: RESOLVERS[0], TRUSTED_SHA256: ''};
+    const conf = {GATEWAY: '', PORT: '443', USERNAME: '', CONF_DIR: '', RESOLVER: RESOLVERS[0], TRUSTED_SHA256: '', KEEP_LAN: 'yes'};
     try {
         const [, bytes] = GLib.file_get_contents(CONF_PATH);
         for (const line of new TextDecoder().decode(bytes).split('\n')) {
@@ -200,6 +200,14 @@ export default class ForcepointVpnPrefs extends ExtensionPreferences {
         });
         advGroup.add(resolverRow);
 
+        const keepLanRow = new Adw.SwitchRow({
+            title: 'Keep local network reachable',
+            subtitle: 'Lets devices on your local network (SSH, Jupyter, …) keep reaching this ' +
+                'machine while the VPN is connected, even if the VPN uses the same addresses.',
+            active: conf.KEEP_LAN !== 'no',
+        });
+        advGroup.add(keepLanRow);
+
         // Save
         const saveGroup = new Adw.PreferencesGroup();
         page.add(saveGroup);
@@ -218,6 +226,7 @@ export default class ForcepointVpnPrefs extends ExtensionPreferences {
                 CONF_DIR: confDirRow.text.trim(),
                 RESOLVER: RESOLVERS[resolverRow.selected],
                 TRUSTED_SHA256: normalizeFingerprint(fpRow.text),
+                KEEP_LAN: keepLanRow.active ? 'yes' : 'no',
             };
             const bad = Object.keys(VALID).filter(k => !VALID[k](next[k]));
             if (bad.length) {

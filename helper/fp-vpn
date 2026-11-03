@@ -14,9 +14,45 @@ STATEFILE=/run/fp-vpn.state
 CERTFILE=/run/fp-vpn.cert        # untrusted fingerprint seen on the last attempt
 LOG=/var/log/fp-vpn.log
 LOGIN_TIMEOUT=60          # seconds to wait for the login to complete
+LAN_TABLE=4848            # routing table and rule priority used by "keep LAN reachable"
+LAN_PRIO=4848
 SELF="$(readlink -f "$0")"
 
 die() { echo "fp-vpn: $*" >&2; exit 1; }
+
+# --- Keep local network reachable -------------------------------------------
+# A VPN may push routes that overlap the network this machine is on (e.g. both
+# use 192.168.25.0/24). Then replies to local clients (SSH, Jupyter, ...) go into
+# the tunnel and connections break. For every directly connected local network
+# we route traffic *from our own LAN address to that network* via the LAN
+# interface. Connections into the VPN use the tunnel's address as source, so
+# they are not affected. Without an overlap the rules change nothing.
+
+# Lines "prefix dev src" for directly connected IPv4 networks, tunnels excluded.
+lan_networks() {
+    ip -4 route show table main proto kernel scope link 2>/dev/null |
+    while read -r prefix _ dev rest; do
+        case "$dev" in lo|tun*|tap*|wg*|ppp*) continue ;; esac
+        [[ $rest =~ src\ ([0-9.]+) ]] || continue
+        echo "$prefix $dev ${BASH_REMATCH[1]}"
+    done
+}
+
+lan_rules_clear() {
+    while ip rule del priority "$LAN_PRIO" 2>/dev/null; do :; done
+    ip route flush table "$LAN_TABLE" 2>/dev/null || true
+}
+
+lan_rules_apply() {        # $1: output of lan_networks
+    local prefix dev src
+    lan_rules_clear
+    while read -r prefix dev src; do
+        [[ -n $prefix ]] || continue
+        ip route add "$prefix" dev "$dev" src "$src" table "$LAN_TABLE" 2>/dev/null
+        ip rule add from "$src" to "$prefix" lookup "$LAN_TABLE" priority "$LAN_PRIO" 2>/dev/null
+        echo "fp-vpn: keeping $prefix reachable via $dev for $src"
+    done <<<"$1"
+}
 
 is_running() {
     [[ -f $PIDFILE ]] && [[ -d /proc/$(cat "$PIDFILE") ]]
@@ -34,6 +70,7 @@ load_config() {
 
     # Defaults
     GATEWAY="" PORT=443 VPN_USER="" CONF_DIR="" RESOLVER=/usr/bin/resolvectl TRUSTED_SHA256=""
+    KEEP_LAN=yes
 
     local key val
     while IFS='=' read -r key val; do
@@ -47,6 +84,7 @@ load_config() {
             CONF_DIR) CONF_DIR=$val ;;
             RESOLVER) RESOLVER=$val ;;
             TRUSTED_SHA256) TRUSTED_SHA256=${val^^} ;;
+            KEEP_LAN) KEEP_LAN=${val,,} ;;
             *) die "unknown setting '$key' in $conf" ;;
         esac
     done <"$conf"
@@ -64,6 +102,8 @@ load_config() {
     [[ -z $TRUSTED_SHA256 || $TRUSTED_SHA256 =~ ^([0-9A-F]{2}:){31}[0-9A-F]{2}$ ]] \
         || die "TRUSTED_SHA256 must be 32 hex pairs separated by colons"
 
+    [[ $KEEP_LAN == yes || $KEEP_LAN == no ]]  || die "KEEP_LAN must be yes or no"
+
     case "$RESOLVER" in
         /usr/bin/resolvectl|/usr/sbin/resolvconf|/sbin/resolvconf|none) ;;
         *) die "RESOLVER must be /usr/bin/resolvectl, resolvconf or none" ;;
@@ -77,6 +117,7 @@ run_client() {
     [[ $EUID -eq 0 ]] || die "internal command"
     local pw line sent=0 authed=0 state started=$SECONDS fp=""
     local trusted="${FP_TRUSTED_SHA256:-}" endpoint="${FP_ENDPOINT:-}"
+    local keep_lan="${FP_KEEP_LAN:-yes}" lan_applied="" lan_now lan_checked=0
     IFS= read -r pw
     exec 0</dev/null
 
@@ -94,6 +135,15 @@ run_client() {
     exec 3>"$in" 4<"$out"
     rm -f "$in" "$out"
     echo connecting >"$STATEFILE"
+
+    # On disconnect (SIGTERM to the session) or any exit: stop the client
+    # and remove our routing rules.
+    trap 'kill -TERM "$cpid" 2>/dev/null; lan_rules_clear; echo disconnected >"$STATEFILE"; exit 0' TERM INT
+
+    if [[ $keep_lan == yes ]]; then
+        lan_applied=$(lan_networks)
+        lan_rules_apply "$lan_applied"
+    fi
 
     while true; do
         if IFS= read -r -t 5 line <&4; then
@@ -139,6 +189,15 @@ run_client() {
         elif (( $? <= 128 )); then
             break                                   # client closed its output
         fi
+        # Follow network changes (other Wi-Fi, new DHCP address) every 15 s.
+        if [[ $keep_lan == yes ]] && (( SECONDS - lan_checked >= 15 )); then
+            lan_checked=$SECONDS
+            lan_now=$(lan_networks)
+            if [[ $lan_now != "$lan_applied" ]]; then
+                lan_applied=$lan_now
+                lan_rules_apply "$lan_applied"
+            fi
+        fi
         if (( ! authed && SECONDS - started > LOGIN_TIMEOUT )); then
             echo "fp-vpn: login not completed within ${LOGIN_TIMEOUT}s, stopping"
             kill -TERM "$cpid" 2>/dev/null
@@ -146,6 +205,7 @@ run_client() {
         fi
     done
     wait "$cpid"
+    lan_rules_clear
     echo disconnected >"$STATEFILE"
 }
 
@@ -170,8 +230,9 @@ case "${1:-}" in
         [[ -f $CONF_DIR ]] && local_args+=(-c "$CONF_DIR")
 
         rm -f "$CERTFILE"
+        lan_rules_clear            # leftovers from a crash
         echo "=== $(date '+%F %T') fp-vpn connect to $GATEWAY:$PORT as $VPN_USER" >>"$LOG"
-        FP_TRUSTED_SHA256="$TRUSTED_SHA256" FP_ENDPOINT="$GATEWAY:$PORT" \
+        FP_TRUSTED_SHA256="$TRUSTED_SHA256" FP_ENDPOINT="$GATEWAY:$PORT" FP_KEEP_LAN="$KEEP_LAN" \
             setsid "$SELF" _run "${local_args[@]}" <<<"$PW" >>"$LOG" 2>&1 &
         echo $! >"$PIDFILE"
         PW=""
@@ -181,6 +242,7 @@ case "${1:-}" in
             pid=$(cat "$PIDFILE")
             kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
         fi
+        lan_rules_clear
         rm -f "$PIDFILE"
         echo disconnected >"$STATEFILE"
         ;;

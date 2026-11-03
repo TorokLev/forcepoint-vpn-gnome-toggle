@@ -7,3 +7,7 @@
 - First connection to a gateway works from the GUI: the gateway certificate is accepted only if its SHA-256 fingerprint matches the one trusted in Settings. An unknown certificate stops the connection and can be reviewed and trusted in Settings with one click.
 - Helper passes `-c` only when the client's config file exists, so first connections no longer fail with "Failed to read config".
 
+## [1.2.0] - 2026-11-03
+
+- New setting **Keep local network reachable** (on by default): while connected, replies from this machine's LAN address to its local network leave through the LAN interface, so SSH, Jupyter and other incoming connections from the local network keep working even when the VPN pushes routes that overlap the local network (e.g. both use 192.168.25.0/24). Connections into the VPN are not affected. Rules follow network changes and are removed on disconnect.
+
