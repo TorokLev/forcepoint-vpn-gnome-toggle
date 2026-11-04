@@ -1,0 +1,273 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Install to /usr/local/bin/fp-vpn (root-owned, chmod 755).
+# connect / disconnect run via sudo; status runs as the normal user.
+#
+# Settings are read from the calling user's ~/.config/fp-vpn.conf
+# (KEY=value lines). The file is parsed, never sourced, and every
+# value is validated, because this script runs as root.
+set -u
+
+PIDFILE=/run/fp-vpn.pid
+STATEFILE=/run/fp-vpn.state
+CERTFILE=/run/fp-vpn.cert        # untrusted fingerprint seen on the last attempt
+LOG=/var/log/fp-vpn.log
+LOGIN_TIMEOUT=60          # seconds to wait for the login to complete
+LAN_TABLE=4848            # routing table and rule priority used by "keep LAN reachable"
+LAN_PRIO=4848
+SELF="$(readlink -f "$0")"
+
+die() { echo "fp-vpn: $*" >&2; exit 1; }
+
+# --- Keep local network reachable -------------------------------------------
+# A VPN may push routes that overlap the network this machine is on (e.g. both
+# use 192.168.25.0/24). Then replies to local clients (SSH, Jupyter, ...) go into
+# the tunnel and connections break. For every directly connected local network
+# we route traffic *from our own LAN address to that network* via the LAN
+# interface. Connections into the VPN use the tunnel's address as source, so
+# they are not affected. Without an overlap the rules change nothing.
+
+# Lines "prefix dev src" for directly connected IPv4 networks, tunnels excluded.
+lan_networks() {
+    ip -4 route show table main proto kernel scope link 2>/dev/null |
+    while read -r prefix _ dev rest; do
+        case "$dev" in lo|tun*|tap*|wg*|ppp*) continue ;; esac
+        [[ $rest =~ src\ ([0-9.]+) ]] || continue
+        echo "$prefix $dev ${BASH_REMATCH[1]}"
+    done
+}
+
+lan_rules_clear() {
+    while ip rule del priority "$LAN_PRIO" 2>/dev/null; do :; done
+    ip route flush table "$LAN_TABLE" 2>/dev/null || true
+}
+
+lan_rules_apply() {        # $1: output of lan_networks
+    local prefix dev src
+    lan_rules_clear
+    while read -r prefix dev src; do
+        [[ -n $prefix ]] || continue
+        ip route add "$prefix" dev "$dev" src "$src" table "$LAN_TABLE" 2>/dev/null
+        ip rule add from "$src" to "$prefix" lookup "$LAN_TABLE" priority "$LAN_PRIO" 2>/dev/null
+        echo "fp-vpn: keeping $prefix reachable via $dev for $src"
+    done <<<"$1"
+}
+
+is_running() {
+    [[ -f $PIDFILE ]] && [[ -d /proc/$(cat "$PIDFILE") ]]
+}
+
+load_config() {
+    local user="${SUDO_USER:-}"
+    [[ -n $user && $user != root ]] || die "run via sudo from your normal user"
+    local home
+    home=$(getent passwd "$user" | cut -d: -f6)
+    [[ -d $home ]] || die "no home directory for $user"
+
+    local conf="$home/.config/fp-vpn.conf"
+    [[ -f $conf && ! -L $conf ]] || die "missing $conf"
+
+    # Defaults
+    GATEWAY="" PORT=443 VPN_USER="" CONF_DIR="" RESOLVER=/usr/bin/resolvectl TRUSTED_SHA256=""
+    KEEP_LAN=yes
+
+    local key val
+    while IFS='=' read -r key val; do
+        key="${key//[[:space:]]/}"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+        [[ -z $key || $key == \#* ]] && continue
+        case "$key" in
+            GATEWAY)  GATEWAY=$val ;;
+            PORT)     PORT=$val ;;
+            USERNAME) VPN_USER=$val ;;
+            CONF_DIR) CONF_DIR=$val ;;
+            RESOLVER) RESOLVER=$val ;;
+            TRUSTED_SHA256) TRUSTED_SHA256=${val^^} ;;
+            KEEP_LAN) KEEP_LAN=${val,,} ;;
+            *) die "unknown setting '$key' in $conf" ;;
+        esac
+    done <"$conf"
+
+    # Validation: these values end up in a root command line.
+    [[ $GATEWAY =~ ^[A-Za-z0-9.-]{1,253}$ ]]     || die "invalid GATEWAY"
+    [[ $PORT =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "invalid PORT"
+    [[ $VPN_USER =~ ^[A-Za-z0-9._@\\-]{1,64}$ ]] || die "invalid USERNAME"
+
+    # Config folder defaults to the same layout as the official client.
+    [[ -n $CONF_DIR ]] || CONF_DIR="$home/.config/forcepoint/sslvpn/${GATEWAY}_${PORT}"
+    CONF_DIR=$(realpath -m -- "$CONF_DIR")
+    [[ $CONF_DIR == "$home"/* ]]                 || die "CONF_DIR must be inside $home"
+
+    [[ -z $TRUSTED_SHA256 || $TRUSTED_SHA256 =~ ^([0-9A-F]{2}:){31}[0-9A-F]{2}$ ]] \
+        || die "TRUSTED_SHA256 must be 32 hex pairs separated by colons"
+
+    [[ $KEEP_LAN == yes || $KEEP_LAN == no ]]  || die "KEEP_LAN must be yes or no"
+
+    case "$RESOLVER" in
+        /usr/bin/resolvectl|/usr/sbin/resolvconf|/sbin/resolvconf|none) ;;
+        *) die "RESOLVER must be /usr/bin/resolvectl, resolvconf or none" ;;
+    esac
+}
+
+# Internal: runs as root in its own session (started by "connect").
+# Password arrives on stdin. Starts the client, watches its output,
+# answers the password prompt only once it appears, tracks the state.
+run_client() {
+    [[ $EUID -eq 0 ]] || die "internal command"
+    # authed: the gateway accepted the password ("connected" needs CONFIGURED too)
+    local pw line sent=0 authed=0 state started=$SECONDS fp=""
+    local trusted="${FP_TRUSTED_SHA256:-}" endpoint="${FP_ENDPOINT:-}"
+    local keep_lan="${FP_KEEP_LAN:-yes}" lan_applied="" lan_now lan_checked=0
+    IFS= read -r pw
+    exec 0</dev/null
+
+    local in out
+    in=$(mktemp -u /run/fp-vpn-in.XXXXXX)
+    out=$(mktemp -u /run/fp-vpn-out.XXXXXX)
+    mkfifo -m 600 "$in" "$out" || exit 1
+
+    # Unbuffered output so the prompt reaches us immediately.
+    local buf=()
+    command -v stdbuf >/dev/null && buf=(stdbuf -o0 -e0)
+
+    "${buf[@]}" forcepoint-client "$@" <"$in" >"$out" 2>&1 &
+    local cpid=$!
+    exec 3>"$in" 4<"$out"
+    rm -f "$in" "$out"
+    echo connecting >"$STATEFILE"
+
+    # On disconnect (SIGTERM to the session) or any exit: stop the client
+    # and remove our routing rules.
+    trap 'kill -TERM "$cpid" 2>/dev/null; lan_rules_clear; echo disconnected >"$STATEFILE"; exit 0' TERM INT
+
+    if [[ $keep_lan == yes ]]; then
+        lan_applied=$(lan_networks)
+        lan_rules_apply "$lan_applied"
+    fi
+
+    while true; do
+        if IFS= read -r -t 5 line <&4; then
+            printf '%s\n' "$line"
+            if [[ $line == *"SHA-256 fingerprint: "* ]]; then
+                fp=${line##*SHA-256 fingerprint: }
+                fp=${fp//[[:space:]]/}
+                fp=${fp^^}
+            elif [[ $line == *"Do you accept the certificate?"* ]]; then
+                if [[ -n $fp && $fp == "$trusted" ]]; then
+                    sleep 0.5
+                    printf 'y\n' >&3
+                    echo "fp-vpn: certificate matches the trusted fingerprint, accepted"
+                else
+                    # Never accept an unknown certificate. Record it so the
+                    # user can review it in Settings, then stop.
+                    printf '%s %s\n' "$endpoint" "${fp:-unknown}" >"$CERTFILE"
+                    chmod 644 "$CERTFILE"
+                    echo "fp-vpn: certificate ${fp:-unknown} is not trusted, stopping (review it in Settings)"
+                    kill -TERM "$cpid" 2>/dev/null
+                fi
+            elif [[ $line == *"Please enter password"* ]]; then
+                if (( sent )); then
+                    echo "fp-vpn: password asked again (wrong password?), stopping"
+                    kill -TERM "$cpid" 2>/dev/null
+                else
+                    sleep 0.5                       # let the client finish its prompt
+                    printf '%s\n' "$pw" >&3
+                    pw=""
+                    sent=1
+                    echo "fp-vpn: password sent"
+                fi
+            elif [[ $line == *"Authentication successful"* ]]; then
+                authed=1
+                echo "fp-vpn: password accepted"
+            elif [[ $line == *"STATE cid"*"changed to: "* ]]; then
+                state=${line##*changed to: }
+                if [[ $state == DISCONNECTED ]]; then
+                    echo disconnected >"$STATEFILE"
+                elif [[ $state == CONFIGURED ]] && (( authed )); then
+                    echo connected >"$STATEFILE"
+                    echo "fp-vpn: tunnel configured, connected"
+                fi
+            fi
+        elif (( $? <= 128 )); then
+            break                                   # client closed its output
+        fi
+        # Follow network changes (other Wi-Fi, new DHCP address) every 15 s.
+        if [[ $keep_lan == yes ]] && (( SECONDS - lan_checked >= 15 )); then
+            lan_checked=$SECONDS
+            lan_now=$(lan_networks)
+            if [[ $lan_now != "$lan_applied" ]]; then
+                lan_applied=$lan_now
+                lan_rules_apply "$lan_applied"
+            fi
+        fi
+        # Give up only if the password was never accepted. After a successful
+        # login we never kill the client; the status simply stays "connecting"
+        # until the tunnel is configured.
+        if (( ! authed && SECONDS - started > LOGIN_TIMEOUT )); then
+            echo "fp-vpn: login not completed within ${LOGIN_TIMEOUT}s, stopping"
+            kill -TERM "$cpid" 2>/dev/null
+            started=$SECONDS                        # don't repeat the message
+        fi
+    done
+    wait "$cpid"
+    lan_rules_clear
+    echo disconnected >"$STATEFILE"
+}
+
+case "${1:-}" in
+    connect)
+        is_running && exit 0
+        load_config
+
+        # Password: typed at a terminal, or piped in (the extension sends it
+        # from GNOME Keyring on stdin).
+        if [[ -t 0 ]]; then
+            IFS= read -rsp "VPN password for $VPN_USER: " PW; echo >&2
+        else
+            IFS= read -r PW || true
+        fi
+        [[ -n ${PW:-} ]] || die "no password given on stdin"
+
+        # The client's own config file exists only after the first successful
+        # connection. Without -c the client looks in the same default place
+        # (the calling user's ~/.config/forcepoint/sslvpn/) and creates it.
+        local_args=("$GATEWAY" -p "$PORT" -u "$VPN_USER" -V --resolver "$RESOLVER")
+        [[ -f $CONF_DIR ]] && local_args+=(-c "$CONF_DIR")
+
+        rm -f "$CERTFILE"
+        lan_rules_clear            # leftovers from a crash
+        echo "=== $(date '+%F %T') fp-vpn connect to $GATEWAY:$PORT as $VPN_USER" >>"$LOG"
+        FP_TRUSTED_SHA256="$TRUSTED_SHA256" FP_ENDPOINT="$GATEWAY:$PORT" FP_KEEP_LAN="$KEEP_LAN" \
+            setsid "$SELF" _run "${local_args[@]}" <<<"$PW" >>"$LOG" 2>&1 &
+        echo $! >"$PIDFILE"
+        PW=""
+        ;;
+    disconnect)
+        if is_running; then
+            pid=$(cat "$PIDFILE")
+            kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+        fi
+        lan_rules_clear
+        rm -f "$PIDFILE"
+        echo disconnected >"$STATEFILE"
+        ;;
+    status)
+        if is_running; then
+            state=$(cat "$STATEFILE" 2>/dev/null)
+            [[ $state == connected ]] && echo connected || echo connecting
+        elif [[ -f $CERTFILE ]]; then
+            echo certificate        # last attempt stopped at an untrusted certificate
+        else
+            echo disconnected
+        fi
+        ;;
+    _run)
+        shift
+        run_client "$@"
+        ;;
+    *)
+        echo "usage: $0 connect|disconnect|status" >&2
+        exit 2
+        ;;
+esac
