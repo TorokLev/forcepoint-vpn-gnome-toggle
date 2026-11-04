@@ -191,3 +191,31 @@ VERSION=1.0.0 nfpm package --config packaging/nfpm.yaml --packager deb --target 
 [GPL-2.0-or-later](LICENSE), like GNOME Shell itself.
 
 Forcepoint is a trademark of its respective owner. It is used here only to describe what this tool works with.
+### Option A: package (Ubuntu/Debian, Fedora/RHEL)
+
+Download the package from the [latest release](https://github.com/TorokLev/forcepoint-vpn-gnome-toggle/releases/latest), then:
+
+```bash
+sudo apt install ./forcepoint-vpn-gnome-toggle_*_all.deb        # Ubuntu / Debian
+sudo dnf install ./forcepoint-vpn-gnome-toggle-*.noarch.rpm     # Fedora / RHEL
+```
+
+For the user who runs the install command, the package sets everything up:
+
+- a sudo rule for that user, so connecting works right away (no reboot),
+- the extension enabled, and GNOME's **Use Extensions** switch turned on if it was off.
+
+Then log out and back in once (on X11 <kbd>Alt</kbd>+<kbd>F2</kbd>, `r`, <kbd>Enter</kbd> is enough), so GNOME Shell finds the new extension. The **Forcepoint VPN** tile appears in the system menu (top-right corner).
+
+If you install over SSH or while not logged in to the desktop, the install message lists the one or two commands to run after logging in.
+
+To allow other users on the same machine, add them to the `fp-vpn` group; they log in again and enable the extension once:
+
+```bash
+sudo gpasswd -a <user> fp-vpn
+gnome-extensions enable forcepoint-vpn@local     # as that user
+```
+
+Upgrades never change your GNOME settings. If the extension or GNOME extensions in general are switched off, you get a desktop notification saying how to turn them on.
+
+Remove with `sudo apt remove forcepoint-vpn-gnome-toggle` (or `apt purge` to also remove the group and log), or `sudo dnf remove forcepoint-vpn-gnome-toggle`. Your settings and the password in GNOME Keyring are kept.
